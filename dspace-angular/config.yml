@@ -1,0 +1,11 @@
+rest:
+  ssl: false
+  host: "3.135.187.106"
+  port: 80
+  nameSpace: /server
+
+ui:
+  ssl: false
+  host: "0.0.0.0"
+  port: 4000
+  nameSpace: /

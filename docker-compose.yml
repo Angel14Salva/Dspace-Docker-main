@@ -1,0 +1,464 @@
+# DSpace 7.x Production Docker Compose
+# Para AWS EC2 (8GB RAM) - Universidad
+# PostgreSQL + Solr + Backend + Frontend Angular
+# Variables de entorno en .env
+
+
+networks:
+  dspacenet:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.23.0.0/16
+
+volumes:
+  assetstore:
+  solr_data:
+  postgres_data:
+
+services:
+  # ========== BASE DE DATOS POSTGRESQL ==========
+  dspace-db:
+    container_name: dspace-db
+    image: postgres:16
+    networks:
+      dspacenet:
+        ipv4_address: 172.23.0.10
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./postgres-init.sql:/docker-entrypoint-initdb.d/01-pgcrypto.sql:ro
+    environment:
+      POSTGRES_USER: ${DB_USER}
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+      POSTGRES_DB: ${DB_NAME}
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=en_US.utf8"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER} -d ${DB_NAME}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # ========== SOLR ==========
+  dspace-solr:
+    container_name: dspace-solr
+    image: dspace/dspace-solr:dspace-9_x
+    networks:
+      dspacenet:
+        ipv4_address: 172.23.0.2
+    ports:
+      - "8983:8983"
+    volumes:
+      - solr_data:/var/solr/data
+    environment:
+      SOLR_HEAP: "1024m"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8983/solr/admin/cores || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+  # ========== INICIALIZACIÓN DE SOLR (Crea los cores) ==========
+  # IMPORTANTE: Usa la imagen dspace que tiene los configs de Solr de DSpace
+  solr-init:
+    container_name: dspace-solr-init
+    image: dspace/dspace:dspace-9_x
+    depends_on:
+      dspace-solr:
+        condition: service_healthy
+    networks:
+      dspacenet:
+        ipv4_address: 172.23.0.6
+    volumes:
+      - solr_data:/var/solr/data
+    user: root
+    entrypoint:
+      - /bin/bash
+      - '-c'
+      - |
+        echo "=========================================="
+        echo "Inicializando cores de Solr..."
+        echo "=========================================="
+        
+        # Esperar a que Solr esté listo
+        echo "Esperando a Solr..."
+        for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30; do
+          if curl -sf "http://dspace-solr:8983/solr/admin/cores" > /dev/null 2>&1; then
+            echo "✓ Solr respondiendo"
+            break
+          fi
+          echo "Intento $i/30..."
+          sleep 2
+        done
+        
+        # Crear estructura de directorios primero
+        echo "Creando estructura de directorios..."
+        mkdir -p /var/solr/data/configsets
+        mkdir -p /var/solr/data/search
+        mkdir -p /var/solr/data/statistics
+        
+        # Los configs de Solr de DSpace están en /dspace/solr/ en el contenedor backend
+        echo "Buscando configsets de DSpace en /dspace/solr/..."
+        
+        # Verificar si /dspace/solr existe
+        if [ -d "/dspace/solr" ]; then
+          echo "¡Directorio /dspace/solr encontrado!"
+          ls -la /dspace/solr/ || true
+          SOLR_CONFIGS_PATH="/dspace/solr"
+        elif [ -d "/opt/solr/server/solr/configsets" ]; then
+          SOLR_CONFIGS_PATH="/opt/solr/server/solr/configsets"
+        elif [ -d "/opt/solr-9.8.1/server/solr/configsets" ]; then
+          SOLR_CONFIGS_PATH="/opt/solr-9.8.1/server/solr/configsets"
+        fi
+        
+        echo "Configsets path: $SOLR_CONFIGS_PATH"
+        
+        # Copiar configset base _default primero
+        echo "Copiando configset base _default..."
+        if [ -d "$SOLR_CONFIGS_PATH/_default" ]; then
+          cp -r "$SOLR_CONFIGS_PATH/_default" /var/solr/data/configsets/search
+          cp -r "$SOLR_CONFIGS_PATH/_default" /var/solr/data/configsets/statistics
+        elif [ -d "/opt/solr-9.8.1/server/solr/configsets/_default" ]; then
+          cp -r /opt/solr-9.8.1/server/solr/configsets/_default /var/solr/data/configsets/search
+          cp -r /opt/solr-9.8.1/server/solr/configsets/_default /var/solr/data/configsets/statistics
+        fi
+        
+        # Ahora copiar los archivos específicos de DSpace
+        echo "Copiando configuración específica de DSpace..."
+        
+        # Search core
+        if [ -d "/dspace/solr/search/conf" ]; then
+          echo "Copiando config de search..."
+          mkdir -p /var/solr/data/configsets/search/conf
+          cp -rn /dspace/solr/search/conf/* /var/solr/data/configsets/search/conf/ 2>/dev/null || true
+        else
+          echo "No se encontró /dspace/solr/search/conf, buscando en otras ubicaciones..."
+          find /dspace/solr/search -name "*.xml" 2>/dev/null || true
+        fi
+        
+        # Statistics core
+        if [ -d "/dspace/solr/statistics/conf" ]; then
+          echo "Copiando config de statistics..."
+          mkdir -p /var/solr/data/configsets/statistics/conf
+          cp -rn /dspace/solr/statistics/conf/* /var/solr/data/configsets/statistics/conf/ 2>/dev/null || true
+        else
+          echo "No se encontró /dspace/solr/statistics/conf, buscando en otras ubicaciones..."
+          find /dspace/solr/statistics -name "*.xml" 2>/dev/null || true
+        fi
+        
+        # Verificar que los directorios de configset existan
+        echo "Verificando configsets creados..."
+        ls -la /var/solr/data/configsets/search/conf/ || true
+        ls -la /var/solr/data/configsets/statistics/conf/ || true
+        
+        # Configurar permisos correctamente (usuario solr)
+        echo "Configurando permisos..."
+        chown -R 8983:8983 /var/solr/data/configsets
+        chown -R 8983:8983 /var/solr/data/search
+        chown -R 8983:8983 /var/solr/data/statistics
+        chmod -R 755 /var/solr/data/configsets
+        chmod -R 755 /var/solr/data/search
+        chmod -R 755 /var/solr/data/statistics
+        
+        echo "Permisos configurados correctamente"
+        
+        # Crear core de búsqueda si no existe
+        echo ""
+        echo "Verificando core 'search'..."
+        CORE_EXISTS=$(curl -s "http://dspace-solr:8983/solr/admin/cores?wt=json" | grep -o '"search":' || echo "")
+        if [ -z "$CORE_EXISTS" ]; then
+          echo "Creando core 'search'..."
+          RESPONSE=$(curl -s "http://dspace-solr:8983/solr/admin/cores?action=CREATE&name=search&instanceDir=search&configSet=search")
+          echo "$RESPONSE"
+          sleep 2
+        else
+          echo "✓ Core 'search' ya existe"
+        fi
+        
+        # Crear core de estadísticas si no existe
+        echo ""
+        echo "Verificando core 'statistics'..."
+        CORE_EXISTS=$(curl -s "http://dspace-solr:8983/solr/admin/cores?wt=json" | grep -o '"statistics":' || echo "")
+        if [ -z "$CORE_EXISTS" ]; then
+          echo "Creando core 'statistics'..."
+          RESPONSE=$(curl -s "http://dspace-solr:8983/solr/admin/cores?action=CREATE&name=statistics&instanceDir=statistics&configSet=statistics")
+          echo "$RESPONSE"
+          sleep 2
+        else
+          echo "✓ Core 'statistics' ya existe"
+        fi
+        
+        # Crear core de autoridad si no existe
+        echo ""
+        echo "Verificando core 'authority'..."
+        CORE_EXISTS=$(curl -s "http://dspace-solr:8983/solr/admin/cores?wt=json" | grep -o '"authority":' || echo "")
+        if [ -z "$CORE_EXISTS" ]; then
+          echo "Creando core 'authority'..."
+          mkdir -p /var/solr/data/authority
+          mkdir -p /var/solr/data/configsets/authority
+          if [ -d "/dspace/solr/authority/conf" ]; then
+            cp -r "/dspace/solr/authority/conf/"* /var/solr/data/configsets/authority/ 2>/dev/null || true
+          fi
+          chown -R 8983:8983 /var/solr/data/authority
+          chown -R 8983:8983 /var/solr/data/configsets/authority
+          RESPONSE=$(curl -s "http://dspace-solr:8983/solr/admin/cores?action=CREATE&name=authority&instanceDir=authority&configSet=authority")
+          echo "$RESPONSE"
+          sleep 2
+        else
+          echo "✓ Core 'authority' ya existe"
+        fi
+        
+        # Crear core de OAI si no existe
+        echo ""
+        echo "Verificando core 'oai'..."
+        CORE_EXISTS=$(curl -s "http://dspace-solr:8983/solr/admin/cores?wt=json" | grep -o '"oai":' || echo "")
+        if [ -z "$CORE_EXISTS" ]; then
+          echo "Creando core 'oai'..."
+          mkdir -p /var/solr/data/oai
+          mkdir -p /var/solr/data/configsets/oai
+          if [ -d "/dspace/solr/oai/conf" ]; then
+            cp -r "/dspace/solr/oai/conf/"* /var/solr/data/configsets/oai/ 2>/dev/null || true
+          fi
+          chown -R 8983:8983 /var/solr/data/oai
+          chown -R 8983:8983 /var/solr/data/configsets/oai
+          RESPONSE=$(curl -s "http://dspace-solr:8983/solr/admin/cores?action=CREATE&name=oai&instanceDir=oai&configSet=oai")
+          echo "$RESPONSE"
+          sleep 2
+        else
+          echo "✓ Core 'oai' ya existe"
+        fi
+        
+        # Crear core de qaevent si no existe
+        echo ""
+        echo "Verificando core 'qaevent'..."
+        CORE_EXISTS=$(curl -s "http://dspace-solr:8983/solr/admin/cores?wt=json" | grep -o '"qaevent":' || echo "")
+        if [ -z "$CORE_EXISTS" ]; then
+          echo "Creando core 'qaevent'..."
+          mkdir -p /var/solr/data/qaevent
+          mkdir -p /var/solr/data/configsets/qaevent
+          if [ -d "/dspace/solr/qaevent/conf" ]; then
+            cp -r "/dspace/solr/qaevent/conf/"* /var/solr/data/configsets/qaevent/ 2>/dev/null || true
+          fi
+          chown -R 8983:8983 /var/solr/data/qaevent
+          chown -R 8983:8983 /var/solr/data/configsets/qaevent
+          RESPONSE=$(curl -s "http://dspace-solr:8983/solr/admin/cores?action=CREATE&name=qaevent&instanceDir=qaevent&configSet=qaevent")
+          echo "$RESPONSE"
+          sleep 2
+        else
+          echo "✓ Core 'qaevent' ya existe"
+        fi
+        
+        # Crear core de suggestion si no existe
+        echo ""
+        echo "Verificando core 'suggestion'..."
+        CORE_EXISTS=$(curl -s "http://dspace-solr:8983/solr/admin/cores?wt=json" | grep -o '"suggestion":' || echo "")
+        if [ -z "$CORE_EXISTS" ]; then
+          echo "Creando core 'suggestion'..."
+          mkdir -p /var/solr/data/suggestion
+          mkdir -p /var/solr/data/configsets/suggestion
+          if [ -d "/dspace/solr/suggestion/conf" ]; then
+            cp -r "/dspace/solr/suggestion/conf/"* /var/solr/data/configsets/suggestion/ 2>/dev/null || true
+          fi
+          chown -R 8983:8983 /var/solr/data/suggestion
+          chown -R 8983:8983 /var/solr/data/configsets/suggestion
+          RESPONSE=$(curl -s "http://dspace-solr:8983/solr/admin/cores?action=CREATE&name=suggestion&instanceDir=suggestion&configSet=suggestion")
+          echo "$RESPONSE"
+          sleep 2
+        else
+          echo "✓ Core 'suggestion' ya existe"
+        fi
+        
+        # Crear core de audit si no existe
+        echo ""
+        echo "Verificando core 'audit'..."
+        CORE_EXISTS=$(curl -s "http://dspace-solr:8983/solr/admin/cores?wt=json" | grep -o '"audit":' || echo "")
+        if [ -z "$CORE_EXISTS" ]; then
+          echo "Creando core 'audit'..."
+          mkdir -p /var/solr/data/audit
+          mkdir -p /var/solr/data/configsets/audit
+          if [ -d "/dspace/solr/audit/conf" ]; then
+            cp -r "/dspace/solr/audit/conf/"* /var/solr/data/configsets/audit/ 2>/dev/null || true
+          fi
+          chown -R 8983:8983 /var/solr/data/audit
+          chown -R 8983:8983 /var/solr/data/configsets/audit
+          RESPONSE=$(curl -s "http://dspace-solr:8983/solr/admin/cores?action=CREATE&name=audit&instanceDir=audit&configSet=audit")
+          echo "$RESPONSE"
+          sleep 2
+        else
+          echo "✓ Core 'audit' ya existe"
+        fi
+        
+        # Verificar que los cores fueron creados
+        echo ""
+        echo "=========================================="
+        echo "Cores existentes:"
+        curl -s "http://dspace-solr:8983/solr/admin/cores?wt=json" | grep -o '"name":"[^"]*"' || echo "No se pudieron listar los cores"
+        echo "=========================================="
+        
+        echo "✓ Inicialización de Solr completada"
+
+  # ========== BACKEND DSPACE ==========
+  dspace:
+    container_name: dspace-backend
+    image: dspace/dspace:dspace-9_x
+    depends_on:
+      dspace-db:
+        condition: service_healthy
+      solr-init:
+        condition: service_completed_successfully
+    networks:
+      dspacenet:
+        ipv4_address: 172.23.0.3
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./config/backend/local.cfg:/dspace/config/local.cfg:ro
+      - assetstore:/dspace/assetstore
+    environment:
+      # ===== CONFIGURACIÓN DE BASE DE DATOS =====
+      db__P__url: 'jdbc:postgresql://dspace-db:5432/${DB_NAME}'
+      db__P__username: '${DB_USER}'
+      db__P__password: '${DB_PASSWORD}'
+
+      # ===== CONFIGURACIÓN DE SOLR =====
+      solr__P__server: 'http://dspace-solr:8983/solr'
+
+      # ===== CONFIGURACIÓN DEL SITIO =====
+      dspace__P__name: '${DSPACE_NAME}'
+
+      # ===== CONFIGURACIÓN DE LOGGING =====
+      LOGGING_CONFIG: /dspace/config/log4j2-container.xml
+
+      # ===== CORS PARA EL FRONTEND ANGULAR =====
+      cors__P__allowed__P__origins: '*'
+      cors__P__allowed__P__methods: '*'
+      cors__P__allowed__P__headers: '*'
+      cors__P__allowed__P__credentials: 'true'
+
+      # ===== OAI-PMH HABILITADO (PARA ALICIA - CONCYTEC) =====
+      oai__P__enabled: 'true'
+      oai__P__server__P__url: 'http://${DSPACE_HOST}/oai'
+      oai__P__identifier: 'oai:${DSPACE_HOST}:${HANDLE_PREFIX}'
+      oai__P__admin: '${ADMIN_EMAIL}'
+      oai__P__name: '${DSPACE_NAME}'
+      
+      # ===== INTEGRACIÓN ALICIA =====
+
+      # ===== CONFIGURACIÓN DE PRODUCCIÓN =====
+      dspace__P__dev__P__mode: 'false'
+      dspace__P__install__P__assetstore: '/dspace/assetstore'
+
+      # ===== HANDLE CONFIGURATION =====
+      handle__P__prefix: '${HANDLE_PREFIX}'
+      handle__P__canonical__P__prefix: 'https://hdl.handle.net/'
+
+      # ===== INICIALIZAR SOLR =====
+      SOLR_SEARCH_CORE: 'search'
+      SOLR_STATISTICS_CORE: 'statistics'
+
+      # ===== CONFIGURACIÓN DE ESTADÍSTICAS =====
+      usage-statistics__P__dbfile: 'false'
+
+    entrypoint:
+      - /bin/bash
+      - '-c'
+      - |
+        echo "=========================================="
+        echo "Iniciando DSpace..."
+        echo "=========================================="
+
+        # Esperar PostgreSQL
+        echo "Esperando PostgreSQL..."
+        while ! (echo > /dev/tcp/dspace-db/5432) 2>/dev/null; do
+          sleep 2
+          echo "..."
+        done
+        echo "✓ PostgreSQL listo"
+
+        # Esperar Solr
+        echo "Esperando Solr..."
+        until curl -sf http://dspace-solr:8983/solr/admin/cores > /dev/null; do
+          sleep 2
+          echo "..."
+        done
+        echo "✓ Solr listo"
+
+        # Verificar que los cores existen
+        echo "Verificando cores de Solr..."
+        curl -s "http://dspace-solr:8983/solr/admin/cores?wt=json" | grep -q "search" && echo "✓ Core 'search' encontrado" || echo "⚠ Core 'search' no encontrado"
+        curl -s "http://dspace-solr:8983/solr/admin/cores?wt=json" | grep -q "statistics" && echo "✓ Core 'statistics' encontrado" || echo "⚠ Core 'statistics' no encontrado"
+
+        # Ejecutar migraciones de base de datos
+        echo "Ejecutando migraciones de base de datos..."
+        /dspace/bin/dspace database migrate
+
+        echo "=========================================="
+        echo "Iniciando DSpace Backend..."
+        echo "=========================================="
+
+        # Iniciar DSpace
+        exec java -Xmx2g -Xms1g -jar /dspace/webapps/server-boot.jar
+
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8080/server/api || exit 1"]
+      interval: 30s
+      timeout: 15s
+      retries: 10
+      start_period: 180s
+
+  # ========== FRONTEND ANGULAR (PRODUCTION) ==========
+  dspace-angular:
+    container_name: dspace-angular
+    image: dspace/dspace-angular:dspace-9_x-dist
+    depends_on:
+      - dspace
+    networks:
+      dspacenet:
+        ipv4_address: 172.23.0.4
+    ports:
+      - "4000:80"
+    environment:
+      - DSPACE_UI_SSL=false
+      - DSPACE_UI_HOST=0.0.0.0
+      - DSPACE_UI_PORT=80
+      - DSPACE_REST_SSL=false
+      - DSPACE_REST_HOST=3.135.187.106
+      - DSPACE_REST_PORT=80
+      - DSPACE_REST_NAMESPACE=/server
+    volumes:
+      - ./dspace-angular/config.yml:/app/config/config.yml:ro
+    deploy:
+      resources:
+        limits:
+          memory: 8G
+        reservations:
+          memory: 2G
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:80/ || exit 1"]
+      interval: 60s
+      timeout: 60s
+      retries: 10
+      start_period: 300s
+
+  # ========== PROXY REVERSE (NGINX) ==========
+  dspace-nginx:
+    container_name: dspace-nginx
+    image: nginx:latest
+    depends_on:
+      - dspace
+      - dspace-angular
+    networks:
+      dspacenet:
+        ipv4_address: 172.23.0.5
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost/ || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
